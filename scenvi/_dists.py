@@ -61,7 +61,7 @@ def AOT_Distance(sample, mean):
 
 
 # from Wasserstein Wormhole
-def S2(x, y, eps, lse_mode = False):
+def S2(x, y, eps, lse_mode = True):
                             
     """
     Calculate Sinkhorn Divergnece (S2) between two weighted point clouds
@@ -75,33 +75,32 @@ def S2(x, y, eps, lse_mode = False):
     :return S2: Sinkhorn Divergnece between x and y 
     """ 
 
-    #x,a = x[0], x[1]
-    #y,b = y[0], y[1]
-    # automatically set same weights
-    a = jnp.ones(x.shape[0]) / x.shape[0]
-    b = jnp.ones(y.shape[0]) / y.shape[0]
+    # x,a = x[0], x[1]
+    # y,b = y[0], y[1]
+    # default to uniform without specifying a and b
         
     ot_solve_xy = linear.solve(
         ott.geometry.pointcloud.PointCloud(x, y, cost_fn=None, epsilon = eps),
-        a = a,
-        b = b,
+        # a = a,
+        # b = b,
         lse_mode=lse_mode,
         min_iterations=0,
         max_iterations=100)
 
     ot_solve_xx = linear.solve(
     ott.geometry.pointcloud.PointCloud(x, x, cost_fn=None, epsilon = eps),
-    a = a,
-    b = a,
+    # a = a,
+    # b = a,
     lse_mode=lse_mode,
     min_iterations=0,
     max_iterations=100)
     
     ot_solve_yy = linear.solve(
     ott.geometry.pointcloud.PointCloud(y, y, cost_fn=None, epsilon = eps),
-    a = b,
-    b = b,
+    # a = b,
+    # b = b,
     lse_mode=lse_mode,
     min_iterations=0,
     max_iterations=100)
+
     return(ot_solve_xy.reg_ot_cost - 0.5 * ot_solve_xx.reg_ot_cost - 0.5 * ot_solve_yy.reg_ot_cost)

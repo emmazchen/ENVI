@@ -10,7 +10,6 @@ from flax import struct
 from flax.training import train_state
 from jax import random
 
-
 class FeedForward(nn.Module):
     """
     :meta private:
@@ -639,3 +638,4 @@ class AttentionDecoderModel(nn.Module):
 
         return output
     
+

@@ -75,7 +75,7 @@ class ENVI:
         spatial_coeff=1,
         sc_coeff=1,
         #cov_coeff=1,
-        niche_coeff=1,
+        niche_coeff=10,
         kl_coeff=0.3,
         log_input=0.1,
         stable_eps=1e-6,
@@ -342,6 +342,15 @@ class ENVI:
         dec_cov = jax_prob.math.fill_triangular(dec_cov)
         return jnp.matmul(dec_cov, dec_cov.transpose([0, 2, 1]))
 
+    def batched_S2(self, x, y, epsilon=1e-2, lse_mode=True):
+        """
+        Helper function to run S2 on x and y (batches of 2D matrices)
+        :return: mean_OT_dists, OT_dists 
+                OT_dists is a (batchsize,) array
+        """
+
+        OT_dists = jax.vmap(lambda x, y: S2(x, y, epsilon, lse_mode), in_axes=[0,0])(x, y)
+        return jnp.mean(OT_dists), OT_dists
 
     def create_train_state(self, key=random.key(0), init_lr=0.0001, decay_steps=4000):
         """
@@ -396,32 +405,27 @@ class ENVI:
             #     AOT_Distance(spatial_COVET, self.grammian_cov(spatial_dec_cov))
             # )
 
-            spatial_niche_like = jnp.mean(
-                jax.vmap(lambda x, y: S2(x, y, 1e-6), in_axes=[0,0])(spatial_niche, spatial_dec_niche)
-            )
+            spatial_niche_cost = self.batched_S2(spatial_niche, 
+                                                 spatial_dec_niche, 
+                                                 epsilon=1e-2, 
+                                                 lse_mode=True)[0]
 
             kl_div = jnp.mean(KL(spatial_enc_mu, spatial_enc_logstd)) + jnp.mean(
                 KL(sc_enc_mu, sc_enc_logstd)
             )
 
             loss = (
-                -self.spatial_coeff * spatial_exp_like
+                - self.spatial_coeff * spatial_exp_like
                 - self.sc_coeff * sc_exp_like
                 # - self.cov_coeff * spatial_cov_like
-                - self.niche_coeff * spatial_niche_like
+                + self.niche_coeff * spatial_niche_cost
                 + self.kl_coeff * kl_div
             )
-
-            # print("spatial_exp_like: ", jax.device_get(spatial_exp_like[0]))
-            # print("sc_exp_like: ", jax.device_get(sc_exp_like))
-            # print("spatial_niche_like: ", jax.device_get(spatial_niche_like))
-            # print("kl_div: ", jax.device_get(kl_div))
-
 
             return (
                 loss,
                 # [sc_exp_like, spatial_exp_like, spatial_cov_like, kl_div * 0.5],
-                [sc_exp_like, spatial_exp_like, spatial_niche_like, kl_div * 0.5],
+                [sc_exp_like, spatial_exp_like, spatial_niche_cost, kl_div * 0.5],
             )
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -463,7 +467,7 @@ class ENVI:
         self.params = state.params
 
         tq = trange(training_steps, leave=True, desc="")
-        sc_loss_mean, spatial_loss_mean, cov_loss_mean, kl_loss_mean, count = (
+        sc_loss_mean, spatial_loss_mean, niche_loss_mean, kl_loss_mean, count = (
             0,
             0,
             0,
@@ -508,10 +512,10 @@ class ENVI:
 
             self.params = state.params
 
-            sc_loss_mean, spatial_loss_mean, cov_loss_mean, kl_loss_mean, count = (
+            sc_loss_mean, spatial_loss_mean, niche_loss_mean, kl_loss_mean, count = (
                 sc_loss_mean + loss[1][0],
                 spatial_loss_mean + loss[1][1],
-                cov_loss_mean + loss[1][2],
+                niche_loss_mean + loss[1][2],
                 kl_loss_mean + loss[1][3],
                 count + 1,
             )
@@ -519,8 +523,8 @@ class ENVI:
             if training_step % verbose == 0:
                 print_statement = ""
                 for metric, value in zip(
-                    ["spatial", "sc", "cov", "kl"],
-                    [spatial_loss_mean, sc_loss_mean, cov_loss_mean, kl_loss_mean],
+                    ["spatial", "sc", "niche", "kl"],
+                    [spatial_loss_mean, sc_loss_mean, niche_loss_mean, kl_loss_mean],
                 ):
                     print_statement = (
                         print_statement
@@ -529,7 +533,7 @@ class ENVI:
                         + ": {:.3e}".format(value / count)
                     )
 
-                sc_loss_mean, spatial_loss_mean, cov_loss_mean, kl_loss_mean, count = (
+                sc_loss_mean, spatial_loss_mean, niche_loss_mean, kl_loss_mean, count = (
                     0,
                     0,
                     0,
