@@ -11,9 +11,10 @@ import tensorflow_probability.substrates.jax as jax_prob # type: ignore
 from flax import linen as nn
 from jax import jit, random
 from tqdm import trange
+from math import sqrt
 
 import sys
-sys.path.insert(1, '/home/chene/ENVI/scenvi')
+sys.path.insert(1, '/home/chene5/ENVI_new_copy/scenvi')
 from _dists import (
     KL,
     AOT_Distance,
@@ -75,18 +76,19 @@ class ENVI:
         spatial_coeff=1,
         sc_coeff=1,
         #cov_coeff=1,
-        niche_coeff=10,
+        niche_coeff=0.01,
         kl_coeff=0.3,
         log_input=0.1,
         stable_eps=1e-6,
     ):
-        # take log at the start
-        self.spatial_data = spatial_data
-        self.spatial_data.X = np.log(spatial_data.X + 1)
+
+        self.spatial_data = spatial_data[:, np.intersect1d(spatial_data.var_names, sc_data.var_names)]
         self.sc_data = sc_data
+        if log_input > 0:
+            self.spatial_data.layers["log"] = np.log(self.spatial_data.X + log_input)
+            self.sc_data.layers["log"] = np.log(self.sc_data.X + log_input)
 
         if "highly_variable" not in sc_data.var.columns:
-
             sc_data.layers["log"] = np.log(sc_data.X + 1)
             sc.pp.highly_variable_genes(
                 sc_data, layer="log", n_top_genes=min(num_HVG, sc_data.shape[-1])
@@ -123,6 +125,11 @@ class ENVI:
         self.batch_key = batch_key
         self.cov_genes = cov_genes
         #self.num_cov_genes = num_cov_genes
+        self.overlap_num = self.overlap_genes.shape[0]
+        # self.cov_gene_num = self.spatial_data.obsm["COVET_SQRT"].shape[-1]
+        self.n_niche_genes = self.spatial_data.X.shape[-1]
+        self.full_trans_gene_num = self.sc_data.shape[-1]
+
 
         # print("Computing Niche Covariance Matrices")
 
@@ -141,23 +148,15 @@ class ENVI:
 
         print("Computing Niche Matrices")
         (
-            self.spatial_data.obsm["scaled_niche"],
             self.gene_mins,
             self.gene_maxs
         ) = compute_niche(
             self.spatial_data,
+            self.n_niche_genes,
             self.k_nearest,
             spatial_key=self.spatial_key,
             batch_key=self.batch_key,
         )
-
-        # we don't actually use this (use scaled version)
-        self.spatial_data.obsm["niche"] = (self.spatial_data.obsm["scaled_niche"] + 1) / 2 * (self.gene_maxs - self.gene_mins) + self.gene_mins
-
-        self.overlap_num = self.overlap_genes.shape[0]
-        # self.cov_gene_num = self.spatial_data.obsm["COVET_SQRT"].shape[-1]
-        self.n_niche_genes = self.spatial_data.obsm["scaled_niche"].shape[-1]
-        self.full_trans_gene_num = self.sc_data.shape[-1]
 
         self.num_layers = num_layers
         self.num_neurons = num_neurons
@@ -195,9 +194,7 @@ class ENVI:
             n_output_exp=self.exp_dec_size,
             # n_output_cov=int(self.cov_gene_num * (self.cov_gene_num + 1) / 2),
             k_nearest=self.k_nearest,
-            n_niche_genes = self.n_niche_genes,
-            gene_mins = self.gene_mins,
-            gene_maxs = self.gene_maxs
+            n_niche_genes = self.n_niche_genes
         )
 
         print("Finished Initializing ENVI")
@@ -342,7 +339,7 @@ class ENVI:
         dec_cov = jax_prob.math.fill_triangular(dec_cov)
         return jnp.matmul(dec_cov, dec_cov.transpose([0, 2, 1]))
 
-    def batched_S2(self, x, y, epsilon=1e-2, lse_mode=True):
+    def batched_S2(self, x, y, epsilon, lse_mode):
         """
         Helper function to run S2 on x and y (batches of 2D matrices)
         :return: mean_OT_dists, OT_dists 
@@ -373,7 +370,6 @@ class ENVI:
         )
 
     @partial(jit, static_argnums=(0,))
-    # def train_step(self, state, spatial_inp, spatial_COVET, sc_inp, key=random.key(0)):
     def train_step(self, state, spatial_inp, spatial_niche, sc_inp, key=random.key(0)):
         """
         :meta private:
@@ -464,6 +460,7 @@ class ENVI:
         state = self.create_train_state(
             subkey, init_lr=init_lr, decay_steps=decay_steps
         )
+        self.state = state # save state for later
         self.params = state.params
 
         tq = trange(training_steps, leave=True, desc="")
@@ -545,7 +542,117 @@ class ENVI:
 
         self.latent_rep()
 
-    @partial(jit, static_argnums=(0,))
+    def start_train(
+            self,
+            init_lr=0.0001,
+            decay_steps=4000,
+            key=random.key(0)
+    ):
+        key, subkey = random.split(key)
+        state = self.create_train_state(
+            subkey, init_lr=init_lr, decay_steps=decay_steps
+        )
+        self.state = state # save state for later
+        self.params = state.params
+
+    def continue_train(  
+        self,
+        training_steps=16000,
+        batch_size=128,
+        verbose=16,
+        key=random.key(0),
+    ):
+        '''
+        continue training with pre-existing train state
+        '''
+
+        batch_size = min(
+            self.sc_data.shape[0], min(self.spatial_data.shape[0], batch_size)
+        )
+
+        state = self.state 
+        self.params = state.params
+
+        tq = trange(training_steps, leave=True, desc="")
+        sc_loss_mean, spatial_loss_mean, niche_loss_mean, kl_loss_mean, count = (
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+        sc_X = self.sc_data.X
+        spatial_X = self.spatial_data.X
+        # spatial_COVET = self.spatial_data.obsm["COVET_SQRT"]
+        spatial_niche = self.spatial_data.obsm["scaled_niche"]
+
+        for training_step in tq:
+            key, subkey1, subkey2 = random.split(key, num=3)
+
+            batch_spatial_ind = random.choice(
+                key=subkey1,
+                a=self.spatial_data.shape[0],
+                shape=[batch_size],
+                replace=False,
+            )
+            batch_sc_ind = random.choice(
+                key=subkey2, a=self.sc_data.shape[0], shape=[batch_size], replace=False
+            )
+
+            # batch_spatial_exp, batch_spatial_cov = (
+            #     spatial_X[batch_spatial_ind],
+            #     spatial_COVET[batch_spatial_ind],
+            # )
+            batch_spatial_exp, batch_spatial_niche = (
+                spatial_X[batch_spatial_ind],
+                spatial_niche[batch_spatial_ind],
+            )
+            batch_sc_exp = sc_X[batch_sc_ind]
+
+            key, subkey = random.split(key)
+
+            state, loss = self.train_step(
+                # state, batch_spatial_exp, batch_spatial_cov, batch_sc_exp, key=subkey
+                state, batch_spatial_exp, batch_spatial_niche, batch_sc_exp, key=subkey
+            )
+
+            self.params = state.params
+
+            sc_loss_mean, spatial_loss_mean, niche_loss_mean, kl_loss_mean, count = (
+                sc_loss_mean + loss[1][0],
+                spatial_loss_mean + loss[1][1],
+                niche_loss_mean + loss[1][2],
+                kl_loss_mean + loss[1][3],
+                count + 1,
+            )
+
+            if training_step % verbose == 0:
+                print_statement = ""
+                for metric, value in zip(
+                    ["spatial", "sc", "niche", "kl"],
+                    [spatial_loss_mean, sc_loss_mean, niche_loss_mean, kl_loss_mean],
+                ):
+                    print_statement = (
+                        print_statement
+                        + " "
+                        + metric
+                        + ": {:.3e}".format(value / count)
+                    )
+
+                sc_loss_mean, spatial_loss_mean, niche_loss_mean, kl_loss_mean, count = (
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                tq.set_description(print_statement)
+                tq.refresh()  # to show
+
+        self.latent_rep()
+
+    #@partial(jit, static_argnums=(0,))
     def model_encoder(self, x):
         """
         :meta private:
@@ -553,7 +660,7 @@ class ENVI:
 
         return self.model.bind({"params": self.params}).encoder(x)
 
-    @partial(jit, static_argnums=(0,))
+    #@partial(jit, static_argnums=(0,))
     def model_decoder_exp(self, x):
         """
         :meta private:
@@ -568,7 +675,7 @@ class ENVI:
     #     """
     #     return self.model.bind({"params": self.params}).decoder_cov(x)
     
-    @partial(jit, static_argnums=(0,))
+    #@partial(jit, static_argnums=(0,))
     def model_decoder_niche(self, x):
         """
         :meta private:
@@ -715,12 +822,28 @@ class ENVI:
             self.sc_data[:, self.spatial_data.var_names].X, mode="sc"
         )
 
+    def latent_rep_x(self, x, mode):
+        """
+        Compute latent embeddings for spatial and single cell data, automatically performed after training
+
+        :return: nothing, adds 'envi_latent' self.spatial_data.obsm and self.spatial_data.obsm
+        """
+        if mode=="spatial":
+            input = x.X
+        elif mode=="sc":
+            input = x[:, self.spatial_data.var_names].X
+
+        x.obsm["envi_latent"] = self.encode(
+            input, mode=mode
+        )
+
     def impute_genes(self):
         """
         Impute full transcriptome for spatial data
 
         :return: nothing, adds 'imputation' to self.spatial_data.obsm
         """
+        # does not re-call latent_rep method. make sure latent is up-to-date
 
         self.spatial_data.obsm["imputation"] = pd.DataFrame(
             self.decode_exp(self.spatial_data.obsm["envi_latent"], mode="sc"),
@@ -746,30 +869,38 @@ class ENVI:
     #         self.sc_data.obsm["COVET_SQRT"], self.sc_data.obsm["COVET_SQRT"]
     #     )
 
-    def infer_niches(self):
+
+    def infer_niche_x(self, x, mode):
         """
         Predict niche representation for single-cell data
 
         :return: nothing, adds 'niche' to self.sc_data.obsm
         """
 
-        self.sc_data.obsm["scaled_niche"] = self.decode_niche(
-            self.sc_data.obsm["envi_latent"]
+        self.latent_rep_x(x, mode=mode)
+
+        x.obsm["inferred_scaled_niche"] = self.decode_niche(
+            x.obsm["envi_latent"]
         )
-        self.sc_data.obsm["niche"] = (self.sc_data.obsm["scaled_niche"] + 1) / 2 * (self.gene_maxs - self.gene_mins) + self.gene_mins
+        x.obsm["inferred_niche"] = (x.obsm["inferred_scaled_niche"] * sqrt(self.n_niche_genes) + 1) / 2 * (self.gene_maxs - self.gene_mins) + self.gene_mins
+    
+
+    def infer_niche_sc(self):
+        """
+        Predict niche representation for single-cell data
+
+        :return: nothing, adds 'inferred_niche' to self.sc_data.obsm
+        """
+        self.infer_niche_x(self.sc_data, mode="sc")
 
 
-    def infer_niches_st(self):
+    def infer_niche_st(self):
         """
         For validation
 
         :return: nothing, adds 'inferred_scaled_niche' and 'inferred_niche' to self.sc_data.obsm
         """
-        self.spatial_data.obsm["inferred_scaled_niche"] = self.decode_niche(
-            self.spatial_data.obsm["envi_latent"]
-        )
-        self.spatial_data.obsm["inferred_niche"] = (self.spatial_data.obsm["scaled_niche"] + 1) / 2 * (self.gene_maxs - self.gene_mins) + self.gene_mins
-
+        self.infer_niche_x(self.spatial_data, mode="spatial")
 
 
     def infer_niche_celltype(self, cell_type_key="cell_type"):
@@ -790,14 +921,14 @@ class ENVI:
         )
 
         regression_model = sklearn.neighbors.KNeighborsRegressor(n_neighbors=5).fit(
-            self.spatial_data.obsm["COVET_SQRT"].reshape(
+            self.spatial_data.obsm["scaled_niche"].reshape(
                 [self.spatial_data.shape[0], -1]
             ),
             self.spatial_data.obsm["cell_type_niche"],
         )
 
         sc_cell_type = regression_model.predict(
-            self.sc_data.obsm["COVET_SQRT"].reshape([self.sc_data.shape[0], -1])
+            self.sc_data.obsm["inferred_scaled_niche"].reshape([self.sc_data.shape[0], -1])
         )
 
         self.sc_data.obsm["cell_type_niche"] = pd.DataFrame(

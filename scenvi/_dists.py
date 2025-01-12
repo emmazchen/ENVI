@@ -3,6 +3,7 @@ import tensorflow_probability.substrates.jax.distributions as jnd
 import ott
 from ott.solvers import linear
 
+
 def KL(mean, log_std):
     """
     :meta private:
@@ -61,7 +62,7 @@ def AOT_Distance(sample, mean):
 
 
 # from Wasserstein Wormhole
-def S2(x, y, eps, lse_mode = True):
+def S2(x, y, eps, lse_mode):
                             
     """
     Calculate Sinkhorn Divergnece (S2) between two weighted point clouds

@@ -9,6 +9,22 @@ from flax import linen as nn
 from flax import struct
 from flax.training import train_state
 from jax import random
+from math import sqrt
+
+
+# def MaxMinScale(arr):
+#     """
+#     :meta private:
+#     """
+
+#     arr = (
+#         2
+#         * (arr - arr.min(axis=0, keepdims=True))
+#         / (arr.max(axis=0, keepdims=True) - arr.min(axis=0, keepdims=True))
+#         - 1
+#     )
+#     return arr
+
 
 class FeedForward(nn.Module):
     """
@@ -71,8 +87,6 @@ class CVAE(nn.Module):
     # n_output_cov: int
     k_nearest: int
     n_niche_genes: int
-    gene_mins: float
-    gene_maxs: float
 
     def setup(self):
         """
@@ -86,8 +100,6 @@ class CVAE(nn.Module):
         # n_output_cov = self.n_output_cov
         k_nearest = self.k_nearest
         n_niche_genes = self.n_niche_genes
-        gene_mins = self.gene_mins
-        gene_maxs = self.gene_maxs
 
         self.encoder = FeedForward(
             n_layers=n_layers, n_neurons=n_neurons, n_output=n_latent * 2
@@ -199,7 +211,7 @@ def CalcNicheMats(spatial_data, kNN, spatial_key="spatial", batch_key=-1):
     :meta private:
     """
 
-    ExpData = spatial_data.layers['scaled'] # constructed using scaled data
+    ExpData = spatial_data.layers["scaled_log"] # constructed using scaled log data
 
     if batch_key == -1:
         kNNGraph = sklearn.neighbors.kneighbors_graph(
@@ -301,7 +313,6 @@ def niche_cell_type(
     )
     return cell_type_niche
 
-
 def compute_covet(
     spatial_data, k=8, g=64, genes=[], spatial_key="spatial", batch_key=-1
 ):
@@ -346,10 +357,10 @@ def compute_covet(
     )
 
 def compute_niche(
-        spatial_data, k=8, spatial_key="spatial", batch_key=-1
+        spatial_data, n_niche_genes, k=8, spatial_key="spatial", batch_key=-1
 ):
     """
-    Compute niche matrices for spatial data
+    Compute niche matrices for spatial data in log space
 
     :param spatial_data: (anndata) spatial data, with an obsm indicating spatial location of spot/segmented cell
     :param k: (int) number of nearest neighbours to define niche (default 8)
@@ -361,9 +372,8 @@ def compute_niche(
     """
 
     # get min max of each gene in spatial_data and scale to -1 to 1
-    gene_mins, gene_maxs = spatial_data.X.min(axis=0), spatial_data.X.max(axis=0)
-    # new layer
-    spatial_data.layers['scaled'] = (spatial_data.X - gene_mins) / (gene_maxs - gene_mins) * 2 - 1
+    gene_mins, gene_maxs = spatial_data.layers['log'].min(axis=0), spatial_data.layers['log'].max(axis=0)
+    spatial_data.layers["scaled_log"] = ((spatial_data.layers["log"] - gene_mins) / (gene_maxs - gene_mins) * 2 - 1) / sqrt(n_niche_genes) #divide by n_niche_genes
 
     if batch_key not in spatial_data.obs.columns:
         batch_key = -1
@@ -372,8 +382,11 @@ def compute_niche(
         spatial_data, k, spatial_key=spatial_key, batch_key=batch_key
     )
 
+    spatial_data.obsm["scaled_niche"] = Niches.astype("float32")
+    spatial_data.obsm["niche"] = (spatial_data.obsm["scaled_niche"] * sqrt(n_niche_genes) + 1) / 2 * (gene_maxs - gene_mins) + gene_mins # still in log space
+
+
     return (
-        Niches.astype("float32"),
         gene_mins, 
         gene_maxs
     )
@@ -612,7 +625,7 @@ class AttentionDecoderModel(nn.Module):
     n_neurons: int
     config: DefaultConfig
     out_seq_len: int
-    inp_dim: int      # this is number of st genes
+    inp_dim: int      # this is number of niche genes
 
     @nn.compact
     def __call__(self, inputs, deterministic = False, dropout_rng = random.key(0)):
@@ -634,7 +647,7 @@ class AttentionDecoderModel(nn.Module):
         x = Unembedding(config, self.inp_dim)(x)
 
         # do scaling
-        output = nn.sigmoid(x)
+        output = (nn.sigmoid(x) * 2 - 1) / sqrt(self.inp_dim)
 
         return output
     
